@@ -27,6 +27,9 @@ from WMCore.Database.MongoDB import MongoDB
 from WMCore.MicroService.DataStructs.MSOutputTemplate import MSOutputTemplate
 from WMCore.WMException import WMException
 
+#DBS modules
+from dbs.apis.dbsClient import DbsApi
+
 
 class MSOutputException(WMException):
     """
@@ -247,6 +250,93 @@ class MSOutput(MSCore):
             self.logger.exception(msg)
             self.updateReportDict(summary, "error", msg)
 
+    def getDBSStatus(self, dataset):
+        """
+        The function to get the DBS status of outputs
+        :param dataset: dataset name
+        :return: DBS status of the given dataset
+        """
+
+        # Do not forget to put this url to MSConfig
+        dbsReadUrl = self.msConfig["dbsReadUrl"]
+        dbsApi = DbsApi(url=dbsReadUrl)
+
+        response = None
+        try:
+            response = dbsApi.listDatasets(dataset=dataset, dataset_access_type='*', detail=True)
+        except Exception as ex:
+            msg = "Exception while getting the status of following dataset on DBS: {} ".format(dataset)
+            msg += "Error: {}".format(str(ex))
+            self.logger.exception(msg)
+
+        if response:
+            dbsStatus = response[0]['dataset_access_type']
+            isAllowedStatus = response in self.msConfig["allowedDbsStatuses"]
+
+            if isAllowedStatus:
+                return dbsStatus
+            else:
+                raise Exception("This is not an allowed DBS status: {}".format(str(dbsStatus)))
+        else:
+            return None
+
+    def setDBSStatus(self, workflow):
+        """
+        The function to set the DBS status of outputs as VALID
+        :param workflow: a MSOutputTemplate object workflow
+        :return: the MSOutputTemplate object itself (with the necessary updates in place)
+        """
+        if not isinstance(workflow, MSOutputTemplate):
+            msg = "Unsupported type object '{}' for workflows! ".format(type(workflow))
+            msg += "It needs to be of type: MSOutputTemplate"
+            raise UnsupportedError(msg)
+
+        ## Do not forget to put this url to MSConfig
+        dbsWriteUrl = self.msConfig["dbsWriteUrl"]
+        dbsApi = DbsApi(url=dbsWriteUrl)
+
+        # if anything fail along the way, set it back to "pending"
+        dbsUpdateStatus = "done"
+        for dMap in workflow['OutputMap']:
+
+            # Put this config to MSConfig
+            if self.msConfig['enableDBSStatusChange']:
+
+                try:
+                    #Put this to msconfig!
+                    dbsApi.updateDatasetType(dataset=dMap["Dataset"],
+                                             dataset_access_type=self.msConfig['dbsStatus']["valid"])
+                except Exception as ex:
+                    msg = "Exception while setting the status of following dataset on DBS: {} ".format(dMap["Dataset"])
+                    msg += "Error: {}".format(str(ex))
+                    self.logger.exception(msg)
+
+                dbsStatus = self.getDBSStatus(dMap["Dataset"])
+
+                if dbsStatus == self.msConfig['dbsStatus']["valid"]:
+                    dMap["DBSStatus"] = dbsStatus
+                else:
+                    # There is at least one dataset whose dbs status update is unsuccessful
+                    dbsUpdateStatus = "pending"
+
+            else:
+                msg = "DRY-RUN DBS: DBS status change for DID: {}, ".format(dMap['Dataset'])
+                self.logger.info(msg)
+
+        # Finally, update the MSOutput template document with either partial or
+        # complete transfer ids
+        self.docKeyUpdate(workflow, OutputMap=workflow['OutputMap'])
+        workflow.updateTime()
+        if dbsUpdateStatus == "done":
+            self.logger.info("All the DBS status updates succeeded for: %s. Marking it as 'done'",
+                             workflow['RequestName'])
+            self.docKeyUpdate(workflow, DBSUpdateStatus='done')
+        else:
+            self.logger.info("DBS status updates partially successful for: %s. Keeping it 'pending'",
+                             workflow['RequestName'])
+
+        return workflow
+
     def makeSubscriptions(self, workflow):
         """
         The common function to make the final subscriptions
@@ -447,7 +537,8 @@ class MSOutput(MSCore):
         #    Done: To build it through a pipe
         #    Done: To write back the updated document to MonogoDB
         msPipelineRelVal = Pipeline(name="MSOutputConsumer PipelineRelVal",
-                                    funcLine=[Functor(self.makeSubscriptions),
+                                    funcLine=[Functor(self.setDBSStatus),
+                                              Functor(self.makeSubscriptions),
                                               Functor(self.makeTapeSubscriptions),
                                               Functor(self.docUploader,
                                                       update=True,
@@ -457,7 +548,8 @@ class MSOutput(MSCore):
                                               Functor(self.docDump, pipeLine='PipelineRelVal'),
                                               Functor(self.docCleaner)])
         msPipelineNonRelVal = Pipeline(name="MSOutputConsumer PipelineNonRelVal",
-                                       funcLine=[Functor(self.makeSubscriptions),
+                                       funcLine=[Functor(self.setDBSStatus),
+                                                 Functor(self.makeSubscriptions),
                                                  Functor(self.makeTapeSubscriptions),
                                                  Functor(self.docUploader,
                                                          update=True,
@@ -468,7 +560,7 @@ class MSOutput(MSCore):
                                                  Functor(self.docCleaner)])
 
         wfCounterTotal = 0
-        mQueryDict = {'TransferStatus': 'pending'}
+        mQueryDict = { "$or": [ { "TransferStatus": "pending" }, { "DBSUpdateStatus": "pending" } ] }
         pipeCollections = [(msPipelineRelVal, self.msOutRelValColl),
                            (msPipelineNonRelVal, self.msOutNonRelValColl)]
         for pipeColl in pipeCollections:
