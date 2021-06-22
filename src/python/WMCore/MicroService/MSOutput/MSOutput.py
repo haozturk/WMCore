@@ -734,7 +734,9 @@ class MSOutput(MSCore):
                 self.alertManagerAPI.sendAlert(alertName, alertSeverity, alertSummary, alertDescription, self.alertServiceName)
             raise
 
-        if dataTier in self.uConfig['tiers_to_DDM']['value']:
+        if isRelVal:
+            return True
+        elif dataTier in self.uConfig['tiers_to_DDM']['value']:
             return True
         elif dataTier in self.uConfig['tiers_no_DDM']['value']:
             return False
